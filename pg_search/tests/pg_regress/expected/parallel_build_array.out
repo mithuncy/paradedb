@@ -1,0 +1,82 @@
+-- Test parallel index building with array columns (INT[])
+-- This test verifies the fix for the "mid > len" crash that occurred
+-- when building indexes on array columns in parallel worker contexts
+-- Create a table with an INT[] column
+CREATE TABLE parallel_array_test (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    list_ids INT[]
+);
+-- Insert test data with varying array sizes to test TOAST scenarios
+-- Small arrays (not TOASTed)
+INSERT INTO parallel_array_test (name, list_ids)
+SELECT
+    'name_' || i,
+    ARRAY[i, i+1, i+2]
+FROM generate_series(1, 1000) i;
+INSERT 0 1000
+-- Medium arrays
+INSERT INTO parallel_array_test (name, list_ids)
+SELECT
+    'medium_' || i,
+    ARRAY(SELECT j FROM generate_series(1, 50) j)
+FROM generate_series(1, 1000) i;
+INSERT 0 1000
+-- Large arrays (likely to be TOASTed)
+INSERT INTO parallel_array_test (name, list_ids)
+SELECT
+    'large_' || i,
+    ARRAY(SELECT j FROM generate_series(1, 500) j)
+FROM generate_series(1, 1000) i;
+INSERT 0 1000
+-- Test with NULL arrays
+INSERT INTO parallel_array_test (name, list_ids)
+VALUES ('null_array', NULL);
+INSERT 0 1
+-- Test with empty arrays
+INSERT INTO parallel_array_test (name, list_ids)
+VALUES ('empty_array', ARRAY[]::INT[]);
+INSERT 0 1
+-- Configure for parallel build
+SET max_parallel_maintenance_workers = 4;
+SET
+SET parallel_leader_participation = true;
+SET
+SET maintenance_work_mem = '128MB';
+SET
+-- Create index with array column - this should not crash
+CREATE INDEX parallel_array_idx ON parallel_array_test
+USING bm25 (id, name, list_ids)
+WITH (key_field = 'id');
+CREATE INDEX
+-- Verify the index was created and contains all documents
+SELECT COUNT(*) as num_segments FROM paradedb.index_info('parallel_array_idx');
+ num_segments
+--------------
+            4
+(1 row)
+
+SELECT SUM(num_docs) as total_docs FROM paradedb.index_info('parallel_array_idx');
+ total_docs
+------------
+       3002
+(1 row)
+
+-- Test queries on the indexed array column
+SELECT COUNT(*) FROM parallel_array_test WHERE list_ids @@ '1';
+ count
+-------
+  3000
+(1 row)
+
+SELECT COUNT(*) FROM parallel_array_test WHERE name @@@ 'large';
+ count
+-------
+  1000
+(1 row)
+
+-- Cleanup
+DROP INDEX parallel_array_idx;
+DROP INDEX
+DROP TABLE parallel_array_test;
+DROP TABLE

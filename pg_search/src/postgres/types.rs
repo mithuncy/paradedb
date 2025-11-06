@@ -175,13 +175,25 @@ impl TantivyValue {
                 | PgBuiltInOids::TIMETZOID
                 | PgBuiltInOids::UUIDOID
                 | PgBuiltInOids::INETOID => {
-                    let array: pgrx::Array<Datum> = pgrx::Array::from_datum(datum, false)
+                    // Detoast the array datum to ensure we have access to the actual array data,
+                    // especially important in parallel worker contexts where TOAST pointers may not be valid
+                    let detoasted_datum = pg_sys::pg_detoast_datum(datum.cast_mut_ptr());
+                    let should_free = !std::ptr::eq(datum.cast_mut_ptr(), detoasted_datum);
+
+                    let array: pgrx::Array<Datum> = pgrx::Array::from_datum(Datum::from(detoasted_datum), false)
                         .ok_or(TantivyValueError::DatumDeref)?;
-                    array
+                    let result: Result<Vec<Self>, TantivyValueError> = array
                         .iter()
                         .flatten()
                         .map(|element_datum| Self::try_from_datum(element_datum, oid))
-                        .collect()
+                        .collect();
+
+                    // Free the detoasted datum if it was allocated
+                    if should_free {
+                        pg_sys::pfree(detoasted_datum.cast());
+                    }
+
+                    result
                 }
                 _ => Err(TantivyValueError::UnsupportedArrayOid(oid.value())),
             },
