@@ -780,6 +780,7 @@ pub mod v2 {
 
                 let mut head_blockno = tag as pg_sys::BlockNumber;
                 let mut blockno = head_blockno;
+                let mut prev_blockno = pg_sys::InvalidBlockNumber;
                 let mut cnt = 0;
 
                 while blocks.len() < many && blockno != pg_sys::InvalidBlockNumber {
@@ -834,27 +835,34 @@ pub mod v2 {
                     let mut modified = false;
 
                     let next_blockno = page.next_blockno();
-                    let should_unlink_head = if contents.len == 0 && head_blockno == blockno {
-                        // this is the first page in the list and it's empty
-                        //
-                        // we unlink initial empty pages when they *become* empty, not when the *are* empty
-                        //
-                        // this means a concurrent backend is in the process of recycling this page
-                        false
-                    } else {
-                        // get all that we can/need from this page
-                        while contents.len > 0 && blocks.len() < many {
-                            contents.len -= 1;
-                            blocks.push(contents.entries[contents.len as usize]);
-                            modified = true;
-                        }
-                        cnt += contents.len as usize;
+                    let (should_unlink_head, should_unlink_middle) =
+                        if contents.len == 0 && head_blockno == blockno {
+                            // this is the first page in the list and it's empty
+                            //
+                            // we unlink initial empty pages when they *become* empty, not when the *are* empty
+                            //
+                            // this means a concurrent backend is in the process of recycling this page
+                            (false, false)
+                        } else {
+                            // get all that we can/need from this page
+                            while contents.len > 0 && blocks.len() < many {
+                                contents.len -= 1;
+                                blocks.push(contents.entries[contents.len as usize]);
+                                modified = true;
+                            }
+                            cnt += contents.len as usize;
 
-                        // should we unlink this block from the chain? -- only if it's the head and _we_ made it empty
-                        blockno == head_blockno
-                            && contents.len == 0
-                            && next_blockno != pg_sys::InvalidBlockNumber
-                    };
+                            let should_unlink_head = blockno == head_blockno
+                                && contents.len == 0
+                                && next_blockno != pg_sys::InvalidBlockNumber;
+
+                            // Also unlink empty middle/tail blocks to prevent chain accumulation
+                            let should_unlink_middle = blockno != head_blockno
+                                && prev_blockno != pg_sys::InvalidBlockNumber
+                                && contents.len == 0;
+
+                            (should_unlink_head, should_unlink_middle)
+                        };
 
                     if !modified {
                         // we didn't change anything
@@ -896,7 +904,27 @@ pub mod v2 {
                             );
                         }
 
-                        // Continue with the new head
+                        // Continue with the new head, prev stays the same since we unlinked head
+                        blockno = next_blockno;
+                        continue;
+                    } else if should_unlink_middle {
+                        // Unlink this empty middle/tail block from the chain
+                        let unlinked_blockno = blockno;
+
+                        // Update previous block to skip this empty block
+                        let mut prev_buffer = bman.get_buffer_mut(prev_blockno);
+                        let mut prev_page = prev_buffer.page_mut();
+                        prev_page.special_mut::<BM25PageSpecialData>().next_blockno = next_blockno;
+                        drop(prev_buffer);
+
+                        // Recycle the unlinked block to be reused in a future transaction
+                        self.extend_with_when_recyclable(
+                            bman,
+                            unsafe { pg_sys::ReadNextFullTransactionId() },
+                            std::iter::once(unlinked_blockno),
+                        );
+
+                        // prev_blockno stays the same since we removed the current block
                         blockno = next_blockno;
                         continue;
                     }
@@ -921,6 +949,7 @@ pub mod v2 {
                     }
 
                     // advance to the next block in the chain.
+                    prev_blockno = blockno;
                     blockno = next_blockno;
                 }
 
