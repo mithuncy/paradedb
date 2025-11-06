@@ -96,10 +96,16 @@ pub fn atatat_support(arg: Internal) -> ReturnedNodePointer {
                 let pdb_query_typoid = pdb_query_typoid();
                 let expr_type = get_expr_result_type(rhs);
                 let is_pdb_query = expr_type == pdb_query_typoid;
+                let is_search_query_input = expr_type == search_query_input_typoid;
 
-                // Enhanced error message to diagnose the JDBC paging issue
+                // Allow UNKNOWNOID for JDBC/psql parameter placeholders in prepared statements
+                // Allow SearchQueryInput in case PostgreSQL passes a previously transformed expression
                 assert!(
-                    expr_type == pg_sys::TEXTOID || expr_type == pg_sys::VARCHAROID || is_pdb_query,
+                    expr_type == pg_sys::TEXTOID
+                        || expr_type == pg_sys::VARCHAROID
+                        || expr_type == pg_sys::UNKNOWNOID
+                        || is_pdb_query
+                        || is_search_query_input,
                     "The right-hand side of the `@@@` operator must be a text value. \
                      Got type OID: {} (TEXTOID={}, VARCHAROID={}, UNKNOWNOID={}, pdb.Query={}, SearchQueryInput={})",
                     expr_type,

@@ -121,7 +121,13 @@ fn search_with_match_conjunction_support(arg: Internal) -> ReturnedNodePointer {
         }, |field, lhs, rhs| {
             validate_lhs_type_as_text_compatible(lhs, "&&&");
             let field = field.expect("The left hand side of the `&&&(field, TEXT)` operator must be a field.");
-            assert!(get_expr_result_type(rhs) == pg_sys::TEXTOID, "The right-hand side of the `&&&(field, TEXT)` operator must be a text value");
+            let rhs_type = get_expr_result_type(rhs);
+            // Allow UNKNOWNOID for parameter placeholders in prepared statements
+            assert!(
+                rhs_type == pg_sys::TEXTOID || rhs_type == pg_sys::VARCHAROID || rhs_type == pg_sys::UNKNOWNOID,
+                "The right-hand side of the `&&&(field, TEXT)` operator must be a text value, but got type OID: {}",
+                rhs_type
+            );
             let mut args = PgList::<pg_sys::Node>::new();
 
             args.push(field.into_const().cast());
