@@ -795,7 +795,30 @@ pub mod v2 {
                             buffer
                         }
                         None => {
+                            // Failed to get conditional lock on the head block.
+                            // Before giving up on this XID, check if the freelist is actually empty
+                            // by peeking at it with a shared lock. If it is empty, we can remove the
+                            // XID entry from the tree.
+
+                            // We need to re-acquire the buffer with a shared lock to peek
+                            let peek_buffer = bman.get_buffer(blockno);
+                            let peek_page = peek_buffer.page();
+                            let peek_contents = peek_page.contents_ref::<AvlLeaf>();
+                            let peek_next = peek_page.next_blockno();
+                            let is_empty_and_last = peek_contents.len == 0
+                                && peek_next == pg_sys::InvalidBlockNumber;
+
+                            drop(peek_buffer);
                             drop(root.take());
+
+                            // If the head block is empty and it's the only block, remove the XID entry
+                            if is_empty_and_last {
+                                let mut root = bman.get_buffer_mut(self.start_blockno);
+                                let mut page = root.page_mut();
+                                let mut tree = self.avl_mut(&mut page);
+                                let _ = tree.remove(&found_xid);
+                                drop(root);
+                            }
 
                             // move to the next candidate XID below this one.
                             xid = found_xid - 1;
