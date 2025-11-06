@@ -97,9 +97,17 @@ pub fn atatat_support(arg: Internal) -> ReturnedNodePointer {
                 let expr_type = get_expr_result_type(rhs);
                 let is_pdb_query = expr_type == pdb_query_typoid;
 
+                // Enhanced error message to diagnose the JDBC paging issue
                 assert!(
                     expr_type == pg_sys::TEXTOID || expr_type == pg_sys::VARCHAROID || is_pdb_query,
-                    "The right-hand side of the `@@@` operator must be a text value"
+                    "The right-hand side of the `@@@` operator must be a text value. \
+                     Got type OID: {} (TEXTOID={}, VARCHAROID={}, UNKNOWNOID={}, pdb.Query={}, SearchQueryInput={})",
+                    expr_type,
+                    pg_sys::TEXTOID,
+                    pg_sys::VARCHAROID,
+                    pg_sys::UNKNOWNOID,
+                    pdb_query_typoid,
+                    search_query_input_typoid
                 );
 
 
