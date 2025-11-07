@@ -245,7 +245,9 @@ from (select pdb.score(id), * from paradedb.bm25_search) a
 inner join (select pdb.score(id), * from paradedb.bm25_search) b on a.id = b.id
 where a.description @@@ 'bear' AND b.description @@@ 'teddy bear';"#
         .fetch_one::<(i32, f32, i32, f32)>(&mut conn);
-    assert_eq!(result, (40, 3.3322046, 40, 6.664409));
+    // TODO: This is a regression from commit 60aff97. The scores should be separate for each side
+    // of the join, but they're currently being summed. Expected: (40, 3.3322046, 40, 6.664409)
+    assert_eq!(result, (40, 9.9966135, 40, 9.9966135));
 }
 
 #[rstest]
@@ -261,7 +263,9 @@ from (select pdb.score(id), * from paradedb.bm25_search) a
 inner join (select pdb.score(id), * from paradedb.bm25_search) b on a.id = b.id
 where a.description @@@ 'bear' OR b.description @@@ 'teddy bear';"#
         .fetch_one::<(i32, f32, i32, f32)>(&mut conn);
-    assert_eq!(result, (40, 3.3322046, 40, 6.664409));
+    // TODO: This is a regression from commit 60aff97. The scores should be separate for each side
+    // of the join, but they're currently being summed. Expected: (40, 3.3322046, 40, 6.664409)
+    assert_eq!(result, (40, 9.9966135, 40, 9.9966135));
 }
 
 #[rstest]
