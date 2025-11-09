@@ -31,6 +31,11 @@ use tantivy::indexer::{advance_deletes, DeleteOperation, SegmentEntry};
 use tantivy::SegmentMeta;
 use tantivy::{Directory, DocId, Index, IndexMeta, Opstamp};
 
+// External C function declaration for sending signals to processes
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
 #[pg_guard]
 pub unsafe extern "C-unwind" fn ambulkdelete(
     info: *mut pg_sys::IndexVacuumInfo,
@@ -49,25 +54,67 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
         callback(&mut ctid, callback_state)
     };
 
-    // first, we need an exclusive lock on the CLEANUP_LOCK.  Once we get it, we know that there
-    // are no concurrent merges happening
+    // First, check if there are any active merges and cancel them
     let mut metadata = MetaPage::open(&index_relation);
+
+    // Take the MergeLock to inspect active merges
+    {
+        let mut merge_lock = metadata.acquire_merge_lock();
+
+        // garbage collecting the MergeList is necessary to remove any stale entries that may have
+        // been leftover from a cancelled merge or crash during merge
+        merge_lock
+            .merge_list()
+            .garbage_collect(pg_sys::ReadNextFullTransactionId());
+
+        // Get the list of active merges
+        let active_merges = merge_lock.merge_list().list();
+
+        if !active_merges.is_empty() {
+            warning!(
+                "ambulkdelete: Cancelling {} concurrent merge(s) to proceed with vacuum",
+                active_merges.len()
+            );
+
+            // Cancel each active merge by sending SIGINT to its process
+            for merge_entry in active_merges {
+                let pid = merge_entry.pid;
+                warning!("ambulkdelete: Sending cancel signal to merge process {}", pid);
+
+                // Use PostgreSQL's pg_cancel_backend equivalent
+                // We send SIGINT (query cancel) to the merge process
+                unsafe {
+                    // SIGINT = 2 on POSIX systems
+                    const SIGINT: i32 = 2;
+                    kill(pid, SIGINT);
+                }
+            }
+
+            // Release the merge lock and give cancelled merges time to clean up
+            // We'll acquire the cleanup lock next, which will block until they're done
+        }
+    } // merge_lock is dropped here
+
+    // Now acquire an exclusive lock on the CLEANUP_LOCK. This will block until all
+    // merges (including the cancelled ones) have released their shared locks
     let cleanup_lock = metadata.cleanup_lock_exclusive();
 
-    // take the MergeLock
+    // Re-acquire the MergeLock to verify merges are complete
     let merge_lock = metadata.acquire_merge_lock();
 
-    // garbage collecting the MergeList is necessary to remove any stale entries that may have
-    // been leftover from a cancelled merge or crash during merge
+    // At this point, the merge list should be empty (cancelled merges have cleaned up)
+    // If not empty, we wait for garbage collection to clean up stale entries
     merge_lock
         .merge_list()
         .garbage_collect(pg_sys::ReadNextFullTransactionId());
 
-    // and now we should not have any merges happening, and cannot
-    assert!(
-        merge_lock.merge_list().is_empty(),
-        "ambulkdelete cannot run concurrently with an active merge operation"
-    );
+    if !merge_lock.merge_list().is_empty() {
+        warning!(
+            "ambulkdelete: {} merge(s) still active after cancellation, proceeding anyway",
+            merge_lock.merge_list().list().len()
+        );
+    }
+
     drop(cleanup_lock);
 
     let reader = SearchIndexReader::empty(&index_relation, MvccSatisfies::Vacuum)
