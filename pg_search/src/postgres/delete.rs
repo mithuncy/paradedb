@@ -52,7 +52,72 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     // first, we need an exclusive lock on the CLEANUP_LOCK.  Once we get it, we know that there
     // are no concurrent merges happening
     let mut metadata = MetaPage::open(&index_relation);
-    let cleanup_lock = metadata.cleanup_lock_exclusive();
+
+    // Try to acquire the cleanup lock conditionally. If we can't get it, there's likely a
+    // concurrent merge holding a shared lock on it. In that case, we'll cancel the merge(s).
+    const MAX_RETRIES: usize = 5;
+    const RETRY_DELAY_MS: i64 = 500; // Start with 500ms
+
+    let mut cleanup_lock = None;
+    for attempt in 0..MAX_RETRIES {
+        cleanup_lock = metadata.try_cleanup_lock_exclusive();
+
+        if cleanup_lock.is_some() {
+            // We got the lock, proceed
+            break;
+        }
+
+        // We couldn't get the lock. This means a merge is holding it.
+        // Let's cancel any active merges and wait a bit.
+        if attempt == 0 {
+            pgrx::log!(
+                pg_sys::PgLogLevel::LOG,
+                "vacuum blocked by concurrent merge(s), attempting to cancel..."
+            );
+        }
+
+        // Acquire the merge lock to read the merge list
+        let merge_lock = metadata.acquire_merge_lock();
+        let merge_entries = merge_lock.merge_list().list();
+
+        // Cancel each active merge
+        for merge_entry in merge_entries {
+            let pid = merge_entry.pid;
+            pgrx::log!(
+                pg_sys::PgLogLevel::LOG,
+                "vacuum canceling merge process with PID: {}",
+                pid
+            );
+
+            // Send cancellation signal to the merge process
+            // pg_cancel_backend sends SIGINT to the backend, which will cause check_for_interrupts! to error
+            let result = pg_sys::pg_cancel_backend(pid, false);
+            if !result {
+                pgrx::log!(
+                    pg_sys::PgLogLevel::LOG,
+                    "failed to cancel PID {} (may have already finished or exited)",
+                    pid
+                );
+            }
+        }
+
+        drop(merge_lock);
+
+        // Wait with exponential backoff for the merges to cancel and release their locks
+        if attempt < MAX_RETRIES - 1 {
+            let delay_ms = RETRY_DELAY_MS * (1 << attempt); // Exponential backoff: 500ms, 1s, 2s, 4s
+            pg_sys::pg_usleep(delay_ms * 1000); // pg_usleep takes microseconds
+        }
+    }
+
+    // If we still don't have the lock after retries, fall back to blocking acquisition
+    let cleanup_lock = cleanup_lock.unwrap_or_else(|| {
+        pgrx::log!(
+            pg_sys::PgLogLevel::LOG,
+            "vacuum still blocked after canceling merges, waiting for cleanup lock..."
+        );
+        metadata.cleanup_lock_exclusive()
+    });
 
     // take the MergeLock
     let merge_lock = metadata.acquire_merge_lock();

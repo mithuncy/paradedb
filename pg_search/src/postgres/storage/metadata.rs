@@ -293,6 +293,15 @@ impl MetaPage {
         self.bman.get_buffer_mut(blockno)
     }
 
+    pub fn try_cleanup_lock_exclusive(&mut self) -> Option<BufferMut> {
+        let blockno = if self.data.cleanup_lock == 0 {
+            Self::LEGACY_CLEANUP_LOCK
+        } else {
+            self.data.cleanup_lock
+        };
+        self.bman.get_buffer_for_cleanup_conditional(blockno)
+    }
+
     pub fn cleanup_lock_for_cleanup(&mut self) -> BufferMut {
         let blockno = if self.data.cleanup_lock == 0 {
             Self::LEGACY_CLEANUP_LOCK
