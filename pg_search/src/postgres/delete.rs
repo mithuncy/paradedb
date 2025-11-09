@@ -63,11 +63,73 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
         .merge_list()
         .garbage_collect(pg_sys::ReadNextFullTransactionId());
 
-    // and now we should not have any merges happening, and cannot
-    assert!(
-        merge_lock.merge_list().is_empty(),
-        "ambulkdelete cannot run concurrently with an active merge operation"
-    );
+    // Cancel any concurrent merges instead of waiting for them to finish.
+    // This prevents vacuum from hanging when large merges are in progress.
+    // The cancelled merges will be cleaned up and their work discarded.
+    let mut retry_count = 0;
+    const MAX_RETRIES: i32 = 100; // Retry for up to ~10 seconds
+
+    while !merge_lock.merge_list().is_empty() {
+        if retry_count >= MAX_RETRIES {
+            panic!("ambulkdelete: timed out waiting for merges to be cancelled after {} retries", MAX_RETRIES);
+        }
+
+        // Get list of active merge PIDs and cancel them
+        let merge_entries = merge_lock.merge_list().list();
+        for entry in merge_entries {
+            let merge_pid = entry.pid;
+
+            // Don't try to cancel our own process
+            if merge_pid == pg_sys::MyProcPid {
+                continue;
+            }
+
+            // Cancel the backend using pg_cancel_backend
+            pgrx::warning!(
+                "ambulkdelete: cancelling concurrent merge running in backend with PID {}",
+                merge_pid
+            );
+
+            // Execute pg_cancel_backend via SPI
+            let cancel_result = Spi::get_one::<bool>(&format!(
+                "SELECT pg_cancel_backend({})",
+                merge_pid
+            ));
+
+            match cancel_result {
+                Ok(Some(true)) => {
+                    pgrx::debug1!("ambulkdelete: successfully sent cancel signal to PID {}", merge_pid);
+                }
+                Ok(Some(false)) => {
+                    pgrx::warning!("ambulkdelete: pg_cancel_backend returned false for PID {} (process may have already terminated)", merge_pid);
+                }
+                Ok(None) => {
+                    pgrx::warning!("ambulkdelete: pg_cancel_backend returned NULL for PID {}", merge_pid);
+                }
+                Err(e) => {
+                    pgrx::warning!("ambulkdelete: failed to cancel backend PID {}: {:?}", merge_pid, e);
+                }
+            }
+        }
+
+        // Sleep briefly to allow cancelled merges to clean up
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Garbage collect again to remove entries from cancelled merges
+        merge_lock
+            .merge_list()
+            .garbage_collect(pg_sys::ReadNextFullTransactionId());
+
+        retry_count += 1;
+    }
+
+    if retry_count > 0 {
+        pgrx::info!(
+            "ambulkdelete: successfully cancelled and cleaned up concurrent merges after {} retries",
+            retry_count
+        );
+    }
+
     drop(cleanup_lock);
 
     let reader = SearchIndexReader::empty(&index_relation, MvccSatisfies::Vacuum)
