@@ -49,12 +49,12 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
         callback(&mut ctid, callback_state)
     };
 
-    // first, we need an exclusive lock on the CLEANUP_LOCK.  Once we get it, we know that there
-    // are no concurrent merges happening
+    // Cancel any concurrent merges BEFORE trying to acquire the exclusive cleanup lock.
+    // This prevents vacuum from hanging indefinitely waiting for long-running merges.
     let mut metadata = MetaPage::open(&index_relation);
-    let cleanup_lock = metadata.cleanup_lock_exclusive();
 
-    // take the MergeLock
+    // First, check if there are any active merges and cancel them
+    // We do this WITHOUT holding cleanup_lock_exclusive, which would block
     let merge_lock = metadata.acquire_merge_lock();
 
     // garbage collecting the MergeList is necessary to remove any stale entries that may have
@@ -63,9 +63,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
         .merge_list()
         .garbage_collect(pg_sys::ReadNextFullTransactionId());
 
-    // Cancel any concurrent merges instead of waiting for them to finish.
-    // This prevents vacuum from hanging when large merges are in progress.
-    // The cancelled merges will be cleaned up and their work discarded.
+    // Cancel any concurrent merges to allow us to proceed without hanging
     let mut retry_count = 0;
     const MAX_RETRIES: i32 = 100; // Retry for up to ~10 seconds
 
@@ -130,7 +128,16 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
         );
     }
 
-    drop(cleanup_lock);
+    // All merges are now cancelled and removed from MergeList
+    // We keep holding merge_lock while acquiring cleanup_lock_exclusive to prevent
+    // new merges from starting in the window between dropping merge_lock and acquiring cleanup_lock
+
+    // Now acquire the exclusive cleanup lock. Since we cancelled all merges,
+    // this should succeed immediately without hanging.
+    let cleanup_lock = metadata.cleanup_lock_exclusive();
+
+    // Now we can safely drop the merge_lock
+    drop(merge_lock);
 
     let reader = SearchIndexReader::empty(&index_relation, MvccSatisfies::Vacuum)
         .expect("ambulkdelete: should be able to open a SearchIndexReader");
