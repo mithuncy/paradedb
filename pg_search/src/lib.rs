@@ -81,6 +81,14 @@ pub unsafe extern "C-unwind" fn _PG_init() {
     std::env::set_var("RUST_LOG_STYLE", "never");
     env_logger::init();
 
+    // For Postgres < 17, pg_search must be loaded via shared_preload_libraries because we need
+    // to spawn background worker processes. When loaded this way, the library is mapped into
+    // the postmaster's memory at startup and remains loaded. This means:
+    // 1. Replacing pg_search.so on disk doesn't affect running processes
+    // 2. dlopen() returns the existing in-memory handle, not the new file
+    // 3. The only way to load updated code is to restart the postmaster
+    // Note: Simply reconnecting, dropping/recreating the extension, or starting new workers
+    // will NOT reload the library - a full postmaster restart is required.
     if cfg!(not(feature = "pg17")) && !pg_sys::process_shared_preload_libraries_in_progress {
         error!("pg_search must be loaded via shared_preload_libraries. Add 'pg_search' to shared_preload_libraries in postgresql.conf and restart Postgres.");
     }

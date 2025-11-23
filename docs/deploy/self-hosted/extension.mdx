@@ -112,7 +112,7 @@ Next, add the extension(s) to `shared_preload_libraries` in `postgresql.conf`. A
 shared_preload_libraries = 'pg_search'
 ```
 
-Reload the Postgres server for these changes to take effect.
+**Restart** the Postgres server (full postmaster restart) for these changes to take effect. A configuration reload is not sufficient - the postmaster must be restarted to load the shared library into memory.
 
 ## Load the Extension
 

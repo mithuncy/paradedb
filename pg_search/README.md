@@ -248,6 +248,16 @@ DROP EXTENSION pg_search;
 CREATE EXTENSION pg_search;
 ```
 
+**Important Note About `shared_preload_libraries`:**
+
+If `pg_search` is loaded via `shared_preload_libraries` (required for Postgres < 17), the shared library is loaded into the postmaster process at startup and remains mapped in memory. When you replace `pg_search.so` on disk and reconnect to Postgres, `dlopen` will return the handle to the already-loaded in-memory library rather than reloading from disk.
+
+To load updated code when using `shared_preload_libraries`:
+- You **must restart the postmaster** (full Postgres restart) to unload the old library and load the new one
+- Simply reconnecting, dropping/recreating the extension, or starting new backend workers is **not sufficient**
+
+During development with `cargo pgrx run`, this happens automatically since `cargo pgrx` manages the test Postgres instance lifecycle.
+
 ### Testing
 
 We use `cargo test` as our runner for `pg_search` tests.
